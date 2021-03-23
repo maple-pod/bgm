@@ -2,11 +2,13 @@
 
 set -e
 
-pnpm run build
-
 cd dist
 
-git init
+if git rev-parse --git-dir > /dev/null 2>&1; then
+else
+  git init
+fi
+
 git add -A
 git commit -m 'deploy'
 

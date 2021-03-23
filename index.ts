@@ -1,31 +1,52 @@
 import axios from 'axios'
-import fs from 'fs/promises'
+import { EventEmitter } from 'events'
+import fs from 'fs'
+import fsP from 'fs/promises'
 import rimraf from 'rimraf'
 import ora from 'ora'
+import ytdl from 'ytdl-core'
+import ffmpeg from 'fluent-ffmpeg'
+import PromisePool from 'es6-promise-pool'
+import { spawn,exec } from 'child-process-promise'
+import { path as ffmpegPath } from '@ffmpeg-installer/ffmpeg'
 import { join } from 'path'
-import { Promise as NodeID3 } from 'node-id3'
+import { Promise as NodeID3, Tags } from 'node-id3'
 import { ImageInfo, ImageNodeContainer, ImageNodeContainerValueNode, ImagePropertyNode, ImageSoundNode, WzFile, WzImage } from 'wz-parser'
 
 // Constants
 const WZ_DIR_PATH = join(__dirname, './wz')
-const DIST_DIR_PATH = join (__dirname, './dist')
+const DIST_DIR_PATH = join(__dirname, './dist')
+const BUILD_DATA_PATH = join(DIST_DIR_PATH, 'build.json')
+const DOWNLOAD_CONCURRENCY: number = 20
 
 // Types
+interface BuildData {
+  waitingIds: string[];
+  downloadingIds: string[];
+  doneIds: string[];
+}
+
+interface SaveBgmFilesFunctionParams {
+  bgmDatas: MapleBgmData[];
+  buildData?: BuildData;
+  onProgress?: (waitingIds: string[], downloadingIds: string[], doneIds: string[]) => void;
+}
+
 interface MapleBgmData {
   description: string;
-  filename:    string;
-  mark:        string;
-  metadata:    Metadata;
-  source:      Source;
-  youtube:     string;
+  filename: string;
+  mark: string;
+  metadata: Metadata;
+  source: Source;
+  youtube: string;
 }
 
 interface Metadata {
   albumArtist: AlbumArtist;
-  artist:      Artist;
-  title:       string;
-  year:        string;
-  titleAlt?:   string;
+  artist: Artist;
+  title: string;
+  year: string;
+  titleAlt?: string;
 }
 
 enum AlbumArtist {
@@ -53,10 +74,10 @@ enum Artist {
 }
 
 interface Source {
-  client?:   Client;
-  date?:     Date;
+  client?: Client;
+  date?: Date;
   structure: string;
-  version?:  string;
+  version?: string;
 }
 
 enum Client {
@@ -74,8 +95,17 @@ enum Client {
 }
 
 // Functions
+async function exists(p: string) {
+  try {
+    await fsP.access(p)
+    return true
+  } catch(e) {
+    return false
+  }
+}
+
 function mkdir(p: string) {
-  return fs.mkdir(p, { recursive: true })
+  return fsP.mkdir(p, { recursive: true })
 }
 
 function rm(p: string) {
@@ -87,55 +117,152 @@ function rm(p: string) {
   })
 }
 
-async function saveBgmFiles(bgmData: MapleBgmData[]) {
-  const bgmList: string[] = []
+async function downloadYoutubeMp3(url: string, path: string, tags?: Tags) {
+  await new Promise((resolve, reject) => {
+    const stream = ytdl(url, {
+      quality: 'highestaudio'
+    })
+    ffmpeg({ source: stream })
+      .setFfmpegPath(ffmpegPath)
+      .on('error', reject)
+      .on('end', resolve)
+      .save(path)
+  })
+  if (tags) await NodeID3.write(tags, path)
+}
+
+async function saveBgmFiles({ bgmDatas, buildData, onProgress }: SaveBgmFilesFunctionParams) {
+  const emitter = new EventEmitter()
+  emitter.on('progress', onProgress ?? (() => { }))
+  bgmDatas = bgmDatas.filter((d) => !!d.youtube)
+  function getId(d: MapleBgmData) { return `${d.source.structure}/${d.filename}` }
+  const waitingIds: string[] = buildData
+    ? bgmDatas.map(getId).filter(id => !buildData.doneIds.includes(id))
+    : bgmDatas.map(getId)
+  const downloadingIds: string[] = []
+  const doneIds: string[] = buildData
+    ? [...buildData.doneIds]
+    : []
   const indexedBgmData: Record<string, MapleBgmData> = Object.fromEntries(
-    bgmData.map(d => [`${d.source.structure}/${d.filename}`, d])
+    bgmDatas.map(d => [getId(d), d])
   )
-  async function getInfos(fileName: string) {
-    return (await (new WzFile(join(WZ_DIR_PATH, fileName))).parse()).value!.dir!.filter(i => i.name.startsWith('Bgm')) as ImageInfo[]
+  function registerExitHandler() {
+    let flag = false;
+    ['exit', 'SIGINT', 'SIGUSR1', 'SIGUSR2', 'uncaughtException', 'SIGTERM']
+      .forEach((eventType) => {
+        process.on(eventType, async () => {
+          if (flag) return
+          const data = {
+            waitingIds,
+            downloadingIds,
+            doneIds
+          }
+          fs.writeFileSync(
+            BUILD_DATA_PATH,
+            JSON.stringify(
+              data,
+              null,
+              2
+            )
+          )
+          flag = true
+          process.exit()
+        })
+      })
+  }
+  function emitOnProgress() {
+    emitter.emit('progress', waitingIds, downloadingIds, doneIds)
+  }
+  function start(id: string) {
+    downloadingIds.push(...waitingIds.splice(waitingIds.indexOf(id), 1))
+    emitOnProgress()
+  }
+  function finish(id: string) {
+    doneIds.push(...downloadingIds.splice(waitingIds.indexOf(id), 1))
+    emitOnProgress()
+  }
+  registerExitHandler()
+  async function getWzInfos(fileName: string) {
+    try {
+      return (await (new WzFile(join(WZ_DIR_PATH, fileName))).parse()).value!.dir!.filter(i => i.name.startsWith('Bgm')) as ImageInfo[]
+    } catch (error) {
+      return []
+    }
   }
   const bgmImages: [string, ImageNodeContainer][] = [
-    ...(await getInfos('Sound.wz')),
-    ...(await getInfos('Sound2.wz'))
+    ...(await getWzInfos('Sound.wz')),
+    ...(await getWzInfos('Sound2.wz'))
   ].map(info => [info.name.replace('.img', ''), (new WzImage(info)).parse().value!])
   for (const [folderName, image] of bgmImages) {
     const folderDir = join(DIST_DIR_PATH, folderName)
     const soundImageNodes: [string, ImageNodeContainer][] = (((await image.extractImg()).value! as ImagePropertyNode).children as ImageNodeContainerValueNode[])
       .map(vn => [vn.name, vn.value])
     for (const [soundName, soundImage] of soundImageNodes) {
+      const id = `${folderName}/${soundName}`
+      if (!waitingIds.includes(id) || downloadingIds.includes(id) || doneIds.includes(id)) continue
+      const data = indexedBgmData[id]
+      if (!data) continue
       let buffer = await ((await soundImage.extractImg()).value! as ImageSoundNode).value.extractSound?.()
       if (!buffer) continue
-      const key = `${folderName}/${soundName}`
-      const data = indexedBgmData[key]
-      bgmList.push(key)
+      start(id)
       await mkdir(folderDir)
-      if (data) {
-        buffer = await NodeID3.write({
-          artist: data.metadata.artist,
-          title: data.metadata.title,
-          year: data.metadata.year
-        }, buffer)
-      }
-      await fs.writeFile(join(folderDir, `${soundName}.mp3`), buffer)
+      buffer = await NodeID3.write({
+        artist: data.metadata.artist,
+        title: data.metadata.title,
+        year: data.metadata.year
+      }, buffer)
+      await fsP.writeFile(join(folderDir, `${soundName}.mp3`), buffer)
+      finish(id)
     }
   }
-  await fs.writeFile(
-    join(DIST_DIR_PATH, 'list.json'),
-    JSON.stringify(
-      bgmList,
-      null,
-      2
-    )
-  )
+  const downloadExecutors: [string, (() => Promise<void>)][] = waitingIds
+    .map((id) => {
+      const bgmData = indexedBgmData[id]!
+      return [
+        id,
+        async () => {
+          start(id)
+          const url = `https://youtu.be/${bgmData.youtube}`
+          const folderPath = join(DIST_DIR_PATH, bgmData.source.structure)
+          const outputPath = join(folderPath, `${bgmData.filename}.mp3`)
+          await mkdir(folderPath)
+          await downloadYoutubeMp3(url, outputPath, {
+            artist: bgmData.metadata.artist,
+            title: bgmData.metadata.title,
+            year: bgmData.metadata.year
+          })
+          finish(id)
+        }
+      ]
+    })
+  const promiseProducer = () => {
+    const executor = downloadExecutors.shift()
+    if (!executor) return
+    return executor[1]()
+  }
+  const promisePool = new PromisePool(promiseProducer, DOWNLOAD_CONCURRENCY)
+  await promisePool.start()
 }
 
 // Run
 (async () => {
+  let buildData: BuildData | undefined = undefined
+  try {
+    buildData = require(BUILD_DATA_PATH)
+  } catch (e) {
+    await rm(DIST_DIR_PATH)
+    await exec('git clone -b gh-pages --filter=blob:none --no-checkout https://github.com/maple-pod/bgm.git dist && cd dist && git reset HEAD && git checkout build.json .gitignore')
+    buildData = require(BUILD_DATA_PATH)
+    await exec(`cd dist && git update-index --assume-unchanged ${buildData!.doneIds.map(id => `"${id}.mp3"`).join(' ')}`)
+  }
   const spinner = ora('Start to build BGM repo...').start()
-  await rm(DIST_DIR_PATH)
-  await mkdir(DIST_DIR_PATH)
   const { data }: { data: MapleBgmData[] } = await axios.get('https://raw.githubusercontent.com/maplestory-music/maplebgm-db/prod/bgm.min.json')
-  await saveBgmFiles(data)
+  const onProgress: (waitingIds: string[], downloadingIds: string[], doneIds: string[]) => void =
+    (w, dl, d) => spinner.text = `${Math.floor((1 - (w.length + dl.length) / (w.length + dl.length + d.length)) * 100)}% (Waiting: ${w.length}, Downloading: ${dl.length}, Done: ${d.length})`
+  await saveBgmFiles({
+    bgmDatas: data,
+    buildData,
+    onProgress
+  })
   spinner.succeed('Finish building BGM repo! Ready to deploy!')
 })()
